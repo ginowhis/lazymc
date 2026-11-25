@@ -6,8 +6,9 @@ use bytes::BytesMut;
 use minecraft_protocol::decoder::Decoder;
 use minecraft_protocol::version::v1_14_4::handshake::Handshake;
 use minecraft_protocol::version::v1_20_3::status::{
-    PingRequest, PingResponse, ServerStatus, StatusRequest, StatusResponse,
+    PingRequest, PingResponse, ServerStatus, StatusRequest,
 };
+use serde_json::Value;
 use rand::Rng;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -183,13 +184,49 @@ async fn wait_for_status(client: &Client, stream: &mut TcpStream) -> Result<Serv
 
         // Catch status response
         if packet.id == packets::status::CLIENT_STATUS {
-            let status = StatusResponse::decode(&mut packet.data.as_slice()).map_err(|_| ())?;
-            return Ok(status.server_status);
+            return decode_status(&packet.data);
         }
     }
 
     // Some error occurred
     Err(())
+}
+
+/// Decode a status response payload into a server status.
+///
+/// Servers before Minecraft 1.20.3, and newer servers with a styled MOTD, send `description` as a
+/// JSON text component (an object or an array) rather than a plain string. Flatten it to its plain
+/// text so the status still decodes; everything else is decoded as before.
+fn decode_status(mut data: &[u8]) -> Result<ServerStatus, ()> {
+    let json = String::decode(&mut data).map_err(|_| ())?;
+    let mut status: Value = serde_json::from_str(&json).map_err(|_| ())?;
+    if let Some(description) = status.get_mut("description") {
+        if !description.is_string() {
+            let mut text = String::new();
+            push_component_text(description, &mut text);
+            *description = Value::String(text);
+        }
+    }
+    serde_json::from_value(status).map_err(|_| ())
+}
+
+/// Append the plain text of a JSON text component: its `text`, then its `extra` children.
+fn push_component_text(component: &Value, out: &mut String) {
+    match component {
+        Value::String(text) => out.push_str(text),
+        Value::Number(number) => out.push_str(&number.to_string()),
+        Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+        Value::Array(parts) => parts.iter().for_each(|part| push_component_text(part, out)),
+        Value::Object(map) => {
+            if let Some(text) = map.get("text") {
+                push_component_text(text, out);
+            }
+            if let Some(extra) = map.get("extra") {
+                push_component_text(extra, out);
+            }
+        }
+        Value::Null => {}
+    }
 }
 
 /// Wait for a status response.
@@ -244,4 +281,79 @@ async fn wait_for_ping_timeout(
     tokio::time::timeout(Duration::from_secs(PING_TIMEOUT), status)
         .await
         .map_err(|_| ())?
+}
+
+#[cfg(test)]
+mod tests {
+    use minecraft_protocol::encoder::EncoderWriteExt;
+
+    use super::decode_status;
+
+    /// A status response payload: the JSON as a length-prefixed string.
+    fn payload(json: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.write_string(json, 32_768).unwrap();
+        data
+    }
+
+    fn description(json: &str) -> String {
+        decode_status(&payload(json)).unwrap().description
+    }
+
+    #[test]
+    fn string_description() {
+        // Minecraft 1.20.3+ without styling.
+        let json = r#"{"version":{"name":"1.21.1","protocol":767},"players":{"max":20,"online":0},"description":"A Minecraft Server"}"#;
+        assert_eq!(description(json), "A Minecraft Server");
+    }
+
+    #[test]
+    fn object_description() {
+        // Vanilla 1.20.1.
+        let json = r#"{"description":{"text":"A Minecraft Server"},"players":{"max":20,"online":0},"version":{"name":"1.20.1","protocol":763}}"#;
+        assert_eq!(description(json), "A Minecraft Server");
+    }
+
+    #[test]
+    fn forge_object_description() {
+        // Forge 1.20.1, with its extra fields.
+        let json = r#"{"enforcesSecureChat":true,"forgeData":{"channels":[],"mods":[],"truncated":false,"fmlNetworkVersion":3,"d":"\u0000\u0000"},"description":{"text":"A Minecraft Server"},"players":{"max":20,"online":0},"version":{"name":"1.20.1","protocol":763}}"#;
+        let status = decode_status(&payload(json)).unwrap();
+        assert_eq!(status.description, "A Minecraft Server");
+        assert_eq!(status.version.protocol, 763);
+        assert_eq!(status.players.max, 20);
+    }
+
+    #[test]
+    fn styled_object_description() {
+        // Paper 1.20.3+ with a coloured MOTD (an Adventure component).
+        let json = r#"{"description":{"extra":[{"color":"green","text":"Hello"},{"bold":true,"extra":[" ",{"text":"world"}],"text":""}],"text":""},"players":{"max":20,"online":0},"version":{"name":"1.21.1","protocol":767}}"#;
+        assert_eq!(description(json), "Hello world");
+    }
+
+    #[test]
+    fn legacy_codes_are_kept() {
+        let json = r#"{"description":{"text":"§aHello"},"players":{"max":20,"online":0},"version":{"name":"1.20.1","protocol":763}}"#;
+        assert_eq!(description(json), "\u{a7}aHello");
+    }
+
+    #[test]
+    fn array_description() {
+        let json = r#"{"description":["A ",{"text":"Minecraft"},{"translate":"x"}," Server",1],"players":{"max":20,"online":0},"version":{"name":"1.20.1","protocol":763}}"#;
+        assert_eq!(description(json), "A Minecraft Server1");
+    }
+
+    #[test]
+    fn favicon_is_kept() {
+        let json = r#"{"description":{"text":""},"favicon":"data:image/png;base64,AA==","players":{"max":1,"online":0},"version":{"name":"1.20.1","protocol":763}}"#;
+        let status = decode_status(&payload(json)).unwrap();
+        assert_eq!(status.favicon.as_deref(), Some("data:image/png;base64,AA=="));
+    }
+
+    #[test]
+    fn invalid_status_is_an_error() {
+        assert!(decode_status(&payload(r#"{"description":{"text":"x"}}"#)).is_err());
+        assert!(decode_status(&payload("not json")).is_err());
+        assert!(decode_status(&[]).is_err());
+    }
 }
