@@ -3,20 +3,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use minecraft_protocol::decoder::Decoder;
+use minecraft_protocol::data::server_status::{OnlinePlayers, ServerVersion};
+use minecraft_protocol::decoder::{Decoder, DecoderReadExt};
 use minecraft_protocol::version::v1_14_4::handshake::Handshake;
 use minecraft_protocol::version::v1_20_3::status::{
     PingRequest, PingResponse, ServerStatus, StatusRequest,
 };
-use serde_json::Value;
 use rand::Rng;
+use serde::Deserialize;
+use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time;
 
 use crate::config::Config;
 use crate::proto::client::{Client, ClientState};
-use crate::proto::{packet, packets};
+use crate::proto::{self, packet, packets};
 use crate::proxy;
 use crate::server::{Server, State};
 
@@ -89,6 +91,9 @@ pub async fn poll_server(
     if server.state() == State::Started {
         debug!(target: "lazymc::monitor", "Failed to get status from started server, trying ping...");
         do_ping(config, addr).await?;
+
+        // The server answers, keep it started
+        return Ok(None);
     }
 
     Err(())
@@ -192,22 +197,78 @@ async fn wait_for_status(client: &Client, stream: &mut TcpStream) -> Result<Serv
     Err(())
 }
 
+/// Largest status response JSON accepted, in bytes. Modded servers can send more than the 32 KiB
+/// the protocol crate allows for strings.
+const STATUS_MAX_LEN: usize = 1024 * 1024;
+
 /// Decode a status response payload into a server status.
 ///
-/// Servers before Minecraft 1.20.3, and newer servers with a styled MOTD, send `description` as a
-/// JSON text component (an object or an array) rather than a plain string. Flatten it to its plain
-/// text so the status still decodes; everything else is decoded as before.
-fn decode_status(mut data: &[u8]) -> Result<ServerStatus, ()> {
-    let json = String::decode(&mut data).map_err(|_| ())?;
-    let mut status: Value = serde_json::from_str(&json).map_err(|_| ())?;
-    if let Some(description) = status.get_mut("description") {
-        if !description.is_string() {
+/// A status response means the server is up, so this is lenient: it only fails if the payload is
+/// not JSON at all.
+///
+/// - Servers before Minecraft 1.20.3, and newer servers with a styled MOTD, send `description` as
+///   a JSON text component (an object or an array) rather than a plain string. It is flattened to
+///   its plain text. A missing or null `description` becomes empty.
+/// - If `version` or `players` is missing or malformed (some plugins hide the player list), a
+///   placeholder version is used and one player is reported online, so the server is seen online
+///   but never put to sleep.
+fn decode_status(data: &[u8]) -> Result<ServerStatus, ()> {
+    let status: Value = serde_json::from_str(read_status_json(data)?).map_err(|_| ())?;
+
+    let description = match status.get("description") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text.clone(),
+        Some(component) => {
             let mut text = String::new();
-            push_component_text(description, &mut text);
-            *description = Value::String(text);
+            push_component_text(component, &mut text);
+            text
         }
+    };
+    let favicon = status
+        .get("favicon")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let version = status
+        .get("version")
+        .and_then(|v| ServerVersion::deserialize(v).ok());
+    let players = status
+        .get("players")
+        .and_then(|p| OnlinePlayers::deserialize(p).ok());
+
+    let (version, players) = match (version, players) {
+        (Some(version), Some(players)) => (version, players),
+        (version, players) => {
+            warn!(target: "lazymc::monitor", "Server status has no valid version or player count, keeping the server awake");
+            let version = version.unwrap_or_else(|| ServerVersion {
+                name: proto::PROTO_DEFAULT_VERSION.to_string(),
+                protocol: proto::PROTO_DEFAULT_PROTOCOL,
+            });
+            let max = players.map(|players| players.max).unwrap_or(0);
+            let players = OnlinePlayers {
+                max,
+                online: 1,
+                sample: vec![],
+            };
+            (version, players)
+        }
+    };
+
+    Ok(ServerStatus {
+        version,
+        players,
+        description,
+        favicon,
+    })
+}
+
+/// Read the length-prefixed status JSON string, up to `STATUS_MAX_LEN` bytes.
+fn read_status_json(mut data: &[u8]) -> Result<&str, ()> {
+    let len = data.read_var_i32().map_err(|_| ())?;
+    let len = usize::try_from(len).map_err(|_| ())?;
+    if len > STATUS_MAX_LEN || len > data.len() {
+        return Err(());
     }
-    serde_json::from_value(status).map_err(|_| ())
+    std::str::from_utf8(&data[..len]).map_err(|_| ())
 }
 
 /// Append the plain text of a JSON text component: its `text`, then its `extra` children.
@@ -292,7 +353,8 @@ mod tests {
     /// A status response payload: the JSON as a length-prefixed string.
     fn payload(json: &str) -> Vec<u8> {
         let mut data = Vec::new();
-        data.write_string(json, 32_768).unwrap();
+        data.write_var_i32(json.len() as i32).unwrap();
+        data.extend_from_slice(json.as_bytes());
         data
     }
 
@@ -347,13 +409,91 @@ mod tests {
     fn favicon_is_kept() {
         let json = r#"{"description":{"text":""},"favicon":"data:image/png;base64,AA==","players":{"max":1,"online":0},"version":{"name":"1.20.1","protocol":763}}"#;
         let status = decode_status(&payload(json)).unwrap();
-        assert_eq!(status.favicon.as_deref(), Some("data:image/png;base64,AA=="));
+        assert_eq!(
+            status.favicon.as_deref(),
+            Some("data:image/png;base64,AA==")
+        );
+    }
+
+    #[test]
+    fn missing_or_null_description_is_empty() {
+        let missing =
+            r#"{"players":{"max":20,"online":0},"version":{"name":"1.20.1","protocol":763}}"#;
+        assert_eq!(description(missing), "");
+        let null = r#"{"description":null,"players":{"max":20,"online":0},"version":{"name":"1.20.1","protocol":763}}"#;
+        assert_eq!(description(null), "");
+    }
+
+    #[test]
+    fn missing_players_keeps_the_server_awake() {
+        // For example Paper with setHidePlayers(true).
+        let json = r#"{"description":{"text":"hi"},"version":{"name":"1.20.1","protocol":763}}"#;
+        let status = decode_status(&payload(json)).unwrap();
+        assert_eq!(status.description, "hi");
+        assert_eq!(status.version.protocol, 763);
+        assert_eq!(status.players.online, 1);
+    }
+
+    #[test]
+    fn malformed_players_or_missing_version_keeps_the_server_awake() {
+        let json = r#"{"description":"hi","players":{"max":"many"},"version":{"name":"1.20.1","protocol":763}}"#;
+        assert_eq!(decode_status(&payload(json)).unwrap().players.online, 1);
+
+        let json = r#"{"description":"hi","players":{"max":20,"online":0}}"#;
+        let status = decode_status(&payload(json)).unwrap();
+        assert_eq!(status.players.online, 1);
+        assert_eq!(status.players.max, 20);
+        assert_eq!(
+            status.version.protocol,
+            crate::proto::PROTO_DEFAULT_PROTOCOL
+        );
+
+        // Not even an object: still a status response, so still awake.
+        assert_eq!(decode_status(&payload("[]")).unwrap().players.online, 1);
+    }
+
+    #[test]
+    fn status_over_32_kib_decodes() {
+        // Old Forge packs list every mod in the status.
+        let mods: Vec<String> = (0..1500)
+            .map(|i| format!(r#"{{"modid":"mod{:05}","version":"1.0.0"}}"#, i))
+            .collect();
+        let json = format!(
+            r#"{{"description":{{"text":"modded"}},"players":{{"max":20,"online":0}},"version":{{"name":"1.12.2","protocol":340}},"modinfo":{{"type":"FML","modList":[{}]}}}}"#,
+            mods.join(",")
+        );
+        assert!(json.len() > 40 * 1024, "{} bytes", json.len());
+        let status = decode_status(&payload(&json)).unwrap();
+        assert_eq!(status.description, "modded");
+        assert_eq!(status.players.online, 0);
+    }
+
+    #[test]
+    fn status_over_1_mib_is_refused() {
+        let json = format!(
+            r#"{{"description":"{}"}}"#,
+            "x".repeat(super::STATUS_MAX_LEN)
+        );
+        assert!(decode_status(&payload(&json)).is_err());
+    }
+
+    #[test]
+    fn deep_nesting_is_an_error_not_a_crash() {
+        let depth = 10_000;
+        let json = format!(
+            r#"{{"description":{}"x"{},"players":{{"max":1,"online":0}},"version":{{"name":"1.20.1","protocol":763}}}}"#,
+            r#"{"extra":["#.repeat(depth),
+            "]}".repeat(depth)
+        );
+        assert!(decode_status(&payload(&json)).is_err());
     }
 
     #[test]
     fn invalid_status_is_an_error() {
-        assert!(decode_status(&payload(r#"{"description":{"text":"x"}}"#)).is_err());
         assert!(decode_status(&payload("not json")).is_err());
         assert!(decode_status(&[]).is_err());
+        // Length prefix longer than the data, and a negative length.
+        assert!(decode_status(&[0x05, b'{', b'}']).is_err());
+        assert!(decode_status(&[0xff, 0xff, 0xff, 0xff, 0x0f]).is_err());
     }
 }
