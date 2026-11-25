@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use minecraft_protocol::data::server_status::{OnlinePlayers, ServerVersion};
+use minecraft_protocol::data::server_status::{OnlinePlayer, OnlinePlayers, ServerVersion};
 use minecraft_protocol::decoder::{Decoder, DecoderReadExt};
 use minecraft_protocol::version::v1_14_4::handshake::Handshake;
 use minecraft_protocol::version::v1_20_3::status::{
@@ -37,6 +38,7 @@ pub async fn monitor_server(config: Arc<Config>, server: Arc<Server>) {
     let addr = config.server.address;
 
     let mut poll_interval = time::interval(MONITOR_POLL_INTERVAL);
+    let mut ping_only = false;
 
     loop {
         poll_interval.tick().await;
@@ -44,18 +46,7 @@ pub async fn monitor_server(config: Arc<Config>, server: Arc<Server>) {
         // Poll server state and update internal status
         trace!(target: "lazymc::monitor", "Fetching status for {} ... ", addr);
         let status = poll_server(&config, &server, addr).await;
-        match status {
-            // Got status, update
-            Ok(Some(status)) => server.update_status(&config, Some(status)).await,
-
-            // Error, reset status
-            Err(_) => server.update_status(&config, None).await,
-
-            // Didn't get status, but ping fallback worked, leave as-is, show warning
-            Ok(None) => {
-                warn!(target: "lazymc::monitor", "Failed to poll server status, ping fallback succeeded");
-            }
-        }
+        apply_poll(&config, &server, status, &mut ping_only).await;
 
         // Sleep server when it's bedtime
         if server.should_sleep(&config).await {
@@ -69,6 +60,45 @@ pub async fn monitor_server(config: Arc<Config>, server: Arc<Server>) {
             if !server.force_kill().await {
                 warn!(target: "lazymc", "Failed to force kill server");
             }
+        }
+    }
+}
+
+/// Apply the result of one poll to the server state.
+///
+/// `ping_only` tracks whether the last polls only got a ping answer, so the warning is logged
+/// once when that starts instead of on every poll.
+async fn apply_poll(
+    config: &Config,
+    server: &Server,
+    status: Result<Option<ServerStatus>, ()>,
+    ping_only: &mut bool,
+) {
+    match status {
+        // Got status, update
+        Ok(Some(status)) => {
+            if std::mem::take(ping_only) {
+                info!(target: "lazymc::monitor", "Server status can be read again");
+            }
+            server.update_status(config, Some(status)).await;
+        }
+
+        // Error, reset status
+        Err(_) => {
+            *ping_only = false;
+            server.update_status(config, None).await;
+        }
+
+        // Didn't get status, but ping fallback worked: leave the state as-is. The player count is
+        // unknown and the cached one may be stale, so count the server as active: when unsure,
+        // keep it awake.
+        Ok(None) => {
+            if !std::mem::replace(ping_only, true) {
+                warn!(target: "lazymc::monitor", "Failed to poll server status, ping fallback succeeded, keeping the server awake");
+            } else {
+                debug!(target: "lazymc::monitor", "Failed to poll server status, ping fallback succeeded");
+            }
+            server.update_last_active().await;
         }
     }
 }
@@ -201,6 +231,10 @@ async fn wait_for_status(client: &Client, stream: &mut TcpStream) -> Result<Serv
 /// the protocol crate allows for strings.
 const STATUS_MAX_LEN: usize = 1024 * 1024;
 
+/// Whether the last decoded status needed the fallback below, so the warning is logged once when
+/// that starts instead of on every poll.
+static STATUS_FALLBACK: AtomicBool = AtomicBool::new(false);
+
 /// Decode a status response payload into a server status.
 ///
 /// A status response means the server is up, so this is lenient: it only fails if the payload is
@@ -209,7 +243,8 @@ const STATUS_MAX_LEN: usize = 1024 * 1024;
 /// - Servers before Minecraft 1.20.3, and newer servers with a styled MOTD, send `description` as
 ///   a JSON text component (an object or an array) rather than a plain string. It is flattened to
 ///   its plain text. A missing or null `description` becomes empty.
-/// - If `version` or `players` is missing or malformed (some plugins hide the player list), a
+/// - `players.online` and `players.max` are read on their own; `players.sample` is best effort.
+/// - If `version` or the player count is missing or malformed (some plugins hide it), a
 ///   placeholder version is used and one player is reported online, so the server is seen online
 ///   but never put to sleep.
 fn decode_status(data: &[u8]) -> Result<ServerStatus, ()> {
@@ -231,21 +266,50 @@ fn decode_status(data: &[u8]) -> Result<ServerStatus, ()> {
     let version = status
         .get("version")
         .and_then(|v| ServerVersion::deserialize(v).ok());
-    let players = status
-        .get("players")
-        .and_then(|p| OnlinePlayers::deserialize(p).ok());
+    let players = status.get("players");
+    let count = |key: &str| {
+        players
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let (online, max) = (count("online"), count("max"));
+    // Best effort: MOTD plugins put fake entries here, a bad one must not cost the real count.
+    let sample = players
+        .and_then(|p| p.get("sample"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| OnlinePlayer::deserialize(entry).ok())
+                .collect()
+        })
+        .unwrap_or_default();
 
-    let (version, players) = match (version, players) {
-        (Some(version), Some(players)) => (version, players),
-        (version, players) => {
-            warn!(target: "lazymc::monitor", "Server status has no valid version or player count, keeping the server awake");
+    let (version, players) = match (version, online, max) {
+        (Some(version), Some(online), Some(max)) => {
+            if STATUS_FALLBACK.swap(false, Ordering::Relaxed) {
+                info!(target: "lazymc::monitor", "Server status is complete again");
+            }
+            let players = OnlinePlayers {
+                max,
+                online,
+                sample,
+            };
+            (version, players)
+        }
+        (version, _, max) => {
+            if !STATUS_FALLBACK.swap(true, Ordering::Relaxed) {
+                warn!(target: "lazymc::monitor", "Server status has no valid version or player count, keeping the server awake");
+            } else {
+                debug!(target: "lazymc::monitor", "Server status has no valid version or player count");
+            }
             let version = version.unwrap_or_else(|| ServerVersion {
                 name: proto::PROTO_DEFAULT_VERSION.to_string(),
                 protocol: proto::PROTO_DEFAULT_PROTOCOL,
             });
-            let max = players.map(|players| players.max).unwrap_or(0);
             let players = OnlinePlayers {
-                max,
+                max: max.unwrap_or(0),
                 online: 1,
                 sample: vec![],
             };
@@ -348,7 +412,14 @@ async fn wait_for_ping_timeout(
 mod tests {
     use minecraft_protocol::encoder::EncoderWriteExt;
 
-    use super::decode_status;
+    use std::time::Duration;
+
+    use minecraft_protocol::data::server_status::{OnlinePlayers, ServerVersion};
+    use minecraft_protocol::version::v1_20_3::status::ServerStatus;
+
+    use super::{apply_poll, decode_status};
+    use crate::config::Config;
+    use crate::server::{Server, State};
 
     /// A status response payload: the JSON as a length-prefixed string.
     fn payload(json: &str) -> Vec<u8> {
@@ -450,6 +521,60 @@ mod tests {
 
         // Not even an object: still a status response, so still awake.
         assert_eq!(decode_status(&payload("[]")).unwrap().players.online, 1);
+    }
+
+    #[test]
+    fn malformed_sample_keeps_the_real_count() {
+        // A MOTD plugin's fake sample entry (no uuid) must not turn 0 online into 1.
+        let json = r#"{"description":"hi","players":{"max":20,"online":0,"sample":[{"name":"Welcome!"},{"name":"fh","id":"4566e69f-c907-48ee-8d71-d7ba5aa00d20"}]},"version":{"name":"1.20.1","protocol":763}}"#;
+        let status = decode_status(&payload(json)).unwrap();
+        assert_eq!(status.players.online, 0);
+        assert_eq!(status.players.max, 20);
+        assert_eq!(status.players.sample.len(), 1);
+        assert_eq!(status.players.sample[0].name, "fh");
+    }
+
+    fn status_with(online: u32) -> ServerStatus {
+        ServerStatus {
+            version: ServerVersion {
+                name: "1.20.1".into(),
+                protocol: 763,
+            },
+            players: OnlinePlayers {
+                max: 20,
+                online,
+                sample: vec![],
+            },
+            description: String::new(),
+            favicon: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_only_poll_keeps_a_stale_zero_player_server_awake() {
+        let config: Config = toml::from_str(
+            "[server]\ncommand = \"true\"\n[time]\nsleep_after = 1\nminimum_online_time = 0\n",
+        )
+        .unwrap();
+        let server = Server::default();
+        let mut ping_only = false;
+
+        // A player was on, then the last status that decoded said nobody is.
+        apply_poll(&config, &server, Ok(Some(status_with(1))), &mut ping_only).await;
+        apply_poll(&config, &server, Ok(Some(status_with(0))), &mut ping_only).await;
+        assert_eq!(server.state(), State::Started);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(server.should_sleep(&config).await);
+
+        // Now only pings get through: the cached 0 may be stale, so stay awake.
+        apply_poll(&config, &server, Ok(None), &mut ping_only).await;
+        assert!(ping_only);
+        assert_eq!(server.state(), State::Started);
+        assert!(!server.should_sleep(&config).await);
+
+        // A readable status again clears the ping-only state.
+        apply_poll(&config, &server, Ok(Some(status_with(0))), &mut ping_only).await;
+        assert!(!ping_only);
     }
 
     #[test]
